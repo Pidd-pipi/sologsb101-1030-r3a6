@@ -7,7 +7,7 @@ import type { Tuning } from '$lib/types/tuning';
 import type { Voicing } from '$lib/types/voicing';
 import type { Environment } from '$lib/types/environment';
 import type { Reminder } from '$lib/types/reminder';
-import { DB_NAME, DB_SCHEMA_VERSION, db, listEnvironments, listTunings, listVoicings } from './db';
+import { DB_NAME, DB_SCHEMA_VERSION, db, listEnvironments, listTunings, listVoicings, type DatabaseSnapshot } from './db';
 import { nowIso } from './uuid';
 import { zoneDistribution } from './cents';
 
@@ -102,6 +102,30 @@ export function parseArchive(text: string): PianoArchive {
   if (!candidate.piano || typeof candidate.piano.id !== 'string') throw new Error('缺少 piano.id 字段');
   if (!Array.isArray(candidate.tunings)) throw new Error('tunings 必须是数组');
   return candidate as PianoArchive;
+}
+
+const SNAPSHOT_TABLE_KEYS = ['pianos', 'tunings', 'voicings', 'environments', 'reminders'] as const;
+
+/** 校验并解析整库备份 JSON（合档入口），结构或字段不合法时抛出可读错误 */
+export function parseSnapshot(text: string): DatabaseSnapshot {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('不是合法的 JSON 文本');
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new Error('备份根节点必须是对象');
+  }
+  const candidate = parsed as Partial<DatabaseSnapshot>;
+  if (typeof candidate.name !== 'string') throw new Error('缺少 name 字段，不是本应用的备份文件');
+  if (typeof candidate.schemaVersion !== 'number') throw new Error('缺少 schemaVersion 字段，不是本应用的备份文件');
+  for (const key of SNAPSHOT_TABLE_KEYS) {
+    if (!Array.isArray(candidate[key])) {
+      throw new Error(`缺少 ${key} 数组字段，不是本应用的整库备份`);
+    }
+  }
+  return candidate as DatabaseSnapshot;
 }
 
 /** 触发浏览器下载（纯前端，无需后端） */

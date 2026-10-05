@@ -12,8 +12,9 @@
     DB_SCHEMA_VERSION,
     db,
     exportSnapshot,
-    importSnapshot,
+    mergeSnapshot,
     resetDatabase,
+    type MergeReport,
     type PianoRow,
     type ReminderRow,
     type TuningRow
@@ -31,7 +32,7 @@
     setReminderFilters,
     sortByUrgency
   } from '$lib/stores/reminderStore';
-  import { buildPianoArchive, downloadJson, parseArchive, serializeArchive } from '$lib/utils/export';
+  import { buildPianoArchive, downloadJson, parseSnapshot, serializeArchive } from '$lib/utils/export';
   import type { FilterModel } from '$lib/types/filter';
   import { queryToFilters, toQueryString } from '$lib/utils/query';
 
@@ -49,6 +50,30 @@
   let importOpen = $state(false);
   let importText = $state('');
   let importError = $state<string | null>(null);
+  let mergeReport = $state<MergeReport | null>(null);
+
+  const reportRows = $derived.by(() => {
+    if (!mergeReport) return [];
+    return [
+      { key: 'pianos', label: '钢琴档案', count: mergeReport.pianos },
+      { key: 'tunings', label: '调律记录', count: mergeReport.tunings },
+      { key: 'voicings', label: '整音维修', count: mergeReport.voicings },
+      { key: 'environments', label: '琴房环境', count: mergeReport.environments },
+      { key: 'reminders', label: '周期提醒', count: mergeReport.reminders }
+    ];
+  });
+
+  const reportTotals = $derived.by(() => {
+    if (!mergeReport) return { added: 0, updated: 0, suspended: 0 };
+    return reportRows.reduce(
+      (sum, row) => ({
+        added: sum.added + row.count.added,
+        updated: sum.updated + row.count.updated,
+        suspended: sum.suspended + row.count.suspended
+      }),
+      { added: 0, updated: 0, suspended: 0 }
+    );
+  });
 
   function asArray(value: string | string[] | boolean | undefined): string[] {
     return Array.isArray(value) ? value : [];
@@ -193,17 +218,15 @@
   async function doImport(): Promise<void> {
     importError = null;
     try {
-      const parsed = parseArchive(importText);
-      const snapshot = parsed as unknown as Awaited<ReturnType<typeof exportSnapshot>>;
-      if (!Array.isArray((snapshot as unknown as { pianos?: unknown[] }).pianos)) {
-        throw new Error('缺少 pianos 数组字段，不是本应用的备份文件');
-      }
-      await importSnapshot(snapshot);
+      const snapshot = parseSnapshot(importText);
+      // 单事务按编号合档：同编号取时间戳晚者、缺失照搬、孤儿子记录挂起；失败整体撤回
+      const report = await mergeSnapshot(snapshot);
+      mergeReport = report;
       await refreshCounts();
       importOpen = false;
       importText = '';
     } catch (error) {
-      importError = error instanceof Error ? error.message : '导入失败';
+      importError = error instanceof Error ? error.message : '合档失败，主库未改动';
     }
   }
 
@@ -245,11 +268,66 @@
         onclick={() => {
           importOpen = true;
           importError = null;
-        }}>导入备份</button
+        }}>合档备份（按编号合并）</button
       >
       <button type="button" class="btn-primary" onclick={openCreate} disabled={$pianos.length === 0}>+ 新建周期提醒</button>
     </div>
   </div>
+
+  {#if mergeReport}
+    <div class="card border-l-4 border-l-emerald-500">
+      <div class="mb-2 flex items-center justify-between gap-2">
+        <div class="card-title">
+          <span>合档完成</span>
+          <span class="muted">按编号逐条对齐，同号取时间戳晚者</span>
+        </div>
+        <button type="button" class="btn" onclick={() => (mergeReport = null)}>收起</button>
+      </div>
+      <div class="mb-3 flex flex-wrap gap-2 text-xs">
+        <span class="rounded-full bg-emerald-100 px-3 py-1 font-medium text-emerald-800">新增 {reportTotals.added} 条</span>
+        <span class="rounded-full bg-amber-100 px-3 py-1 font-medium text-amber-800">覆盖 {reportTotals.updated} 条</span>
+        <span class="rounded-full bg-rose-100 px-3 py-1 font-medium text-rose-800">挂起 {reportTotals.suspended} 条</span>
+        <span class="muted">调律偏差与复调标记、温湿度超标天数、周期剩余天数已按合档后数据重算刷新</span>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead class="border-b border-stone-200 text-left text-stone-500">
+            <tr>
+              <th class="py-1.5">档案类别</th>
+              <th class="py-1.5">新增</th>
+              <th class="py-1.5">覆盖</th>
+              <th class="py-1.5">挂起</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each reportRows as row (row.key)}
+              <tr class="border-b border-stone-100">
+                <td class="py-1.5">{row.label}</td>
+                <td class="py-1.5 tabular-nums text-emerald-700">+{row.count.added}</td>
+                <td class="py-1.5 tabular-nums text-amber-700">⇄{row.count.updated}</td>
+                <td class="py-1.5 tabular-nums {row.count.suspended > 0 ? 'font-semibold text-rose-700' : 'text-stone-400'}">
+                  {row.count.suspended}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+      {#if mergeReport.suspended.length > 0}
+        <div class="mt-3">
+          <div class="mb-1 text-xs font-medium text-rose-700">挂起明细（未写库，补齐钢琴档案后可重新合档）</div>
+          <ul class="space-y-1 text-xs text-stone-600">
+            {#each mergeReport.suspended as item (item.table + item.id)}
+              <li class="flex flex-wrap items-center gap-2 rounded-lg bg-rose-50/60 px-2 py-1">
+                <span class="rounded bg-white px-1.5 py-0.5 ring-1 ring-rose-200">{item.label}</span>
+                <span class="muted">{item.reason}</span>
+              </li>
+            {/each}
+          </ul>
+        </div>
+      {/if}
+    </div>
+  {/if}
 
   <div class="badge-row">
     <StatBadge label="提醒条目" value={totals.total} suffix="条" tone="walnut" icon="⏰" />
@@ -434,14 +512,17 @@
       onclick={() => (importOpen = false)}
     ></button>
     <div class="modal-panel relative" role="dialog" aria-modal="true">
-      <h3 class="mb-3 text-base font-semibold">导入本地库备份</h3>
+      <h3 class="mb-3 text-base font-semibold">合并笔记本离线备份</h3>
       {#if importError}
         <div class="mb-3 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-700">{importError}</div>
       {/if}
-      <textarea class="field h-48 font-mono text-xs" bind:value={importText} placeholder="粘贴导出的 JSON 备份内容"></textarea>
+      <div class="mb-2 rounded-lg bg-stone-50 px-3 py-2 text-xs text-stone-600">
+        五类档案按编号逐条对齐：同一条取时间戳较晚的版本，主库缺少的直接照搬；子记录找不到钢琴档案的先挂起不写库。整个合档在单事务中完成，任一校验失败都会整体撤回，旧备份缺少时间戳的行也能用业务日期兜底。
+      </div>
+      <textarea class="field h-48 font-mono text-xs" bind:value={importText} placeholder="粘贴笔记本导出的整库 JSON 备份内容"></textarea>
       <div class="mt-4 flex justify-end gap-2">
         <button type="button" class="btn" onclick={() => (importOpen = false)}>取消</button>
-        <button type="button" class="btn-primary" onclick={doImport}>确认导入（覆盖现有数据）</button>
+        <button type="button" class="btn-primary" onclick={doImport}>确认合档</button>
       </div>
     </div>
   </div>

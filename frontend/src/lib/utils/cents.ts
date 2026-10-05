@@ -2,7 +2,7 @@
  * 音分与频率换算、十二平均律基准音高比对、偏差分档与配色映射
  * 被钢琴台账、调律记录页与提醒页共同消费。
  */
-import { STANDARD_PITCH_HZ } from '$lib/types/tuning';
+import { REPITCH_AVG_THRESHOLD, REPITCH_MAX_THRESHOLD, STANDARD_PITCH_HZ, type TuningZones } from '$lib/types/tuning';
 
 /** 十二平均律半音数 → 频率比 */
 const SEMITONE_RATIO = Math.pow(2, 1 / 12);
@@ -90,7 +90,29 @@ export function formatCents(cents: number): string {
 
 /** 判断是否需要二次复调 */
 export function needsRepitch(avgDeviationCents: number, maxDeviationCents: number): boolean {
-  return Math.abs(avgDeviationCents) > 8 || Math.abs(maxDeviationCents) > 20;
+  return Math.abs(avgDeviationCents) > REPITCH_AVG_THRESHOLD || Math.abs(maxDeviationCents) > REPITCH_MAX_THRESHOLD;
+}
+
+/**
+ * 由基准音高与各音区音分重算一条调律记录的派生指标：
+ * 平均偏差取三音区均值，最大偏差取绝对值最大者，并据此判定是否需二次复调。
+ * （合档后旧备份里算错或缺失的偏差值按同一口径统一刷新）
+ */
+export function deriveTuningMetrics(zones: TuningZones): {
+  avgDeviationCents: number;
+  maxDeviationCents: number;
+  pitchRaised: boolean;
+} {
+  const values = [zones.bass, zones.mid, zones.treble];
+  const avgDeviationCents = Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(1));
+  const maxDeviationCents = Number(
+    values.reduce((worst, value) => (Math.abs(value) > Math.abs(worst) ? value : worst), values[0]).toFixed(1)
+  );
+  return {
+    avgDeviationCents,
+    maxDeviationCents,
+    pitchRaised: needsRepitch(avgDeviationCents, maxDeviationCents)
+  };
 }
 
 /** 音区偏差分布（低 / 中 / 高） */
