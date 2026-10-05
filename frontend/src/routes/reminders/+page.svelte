@@ -12,12 +12,12 @@
     DB_SCHEMA_VERSION,
     db,
     exportSnapshot,
-    importSnapshot,
     resetDatabase,
     type PianoRow,
     type ReminderRow,
     type TuningRow
   } from '$lib/utils/db';
+  import { mergeSnapshot, parseSnapshot, type MergeCounts, type MergeReport } from '$lib/utils/merge';
   import { createEmptyReminder, daysToDue, type Reminder } from '$lib/types/reminder';
   import {
     computeNextDue,
@@ -31,7 +31,7 @@
     setReminderFilters,
     sortByUrgency
   } from '$lib/stores/reminderStore';
-  import { buildPianoArchive, downloadJson, parseArchive, serializeArchive } from '$lib/utils/export';
+  import { buildPianoArchive, downloadJson, serializeArchive } from '$lib/utils/export';
   import type { FilterModel } from '$lib/types/filter';
   import { queryToFilters, toQueryString } from '$lib/utils/query';
 
@@ -49,6 +49,7 @@
   let importOpen = $state(false);
   let importText = $state('');
   let importError = $state<string | null>(null);
+  let mergeReport = $state<MergeReport | null>(null);
 
   function asArray(value: string | string[] | boolean | undefined): string[] {
     return Array.isArray(value) ? value : [];
@@ -190,21 +191,49 @@
     downloadJson(`gbpianotune-备份-${snapshot.exportedAt.slice(0, 10)}.json`, JSON.stringify(snapshot, null, 2));
   }
 
-  async function doImport(): Promise<void> {
+  /** 合档：按编号逐条对齐合并备份，任一环节失败整体撤回 */
+  async function doMerge(): Promise<void> {
     importError = null;
     try {
-      const parsed = parseArchive(importText);
-      const snapshot = parsed as unknown as Awaited<ReturnType<typeof exportSnapshot>>;
-      if (!Array.isArray((snapshot as unknown as { pianos?: unknown[] }).pianos)) {
-        throw new Error('缺少 pianos 数组字段，不是本应用的备份文件');
-      }
-      await importSnapshot(snapshot);
+      const snapshot = parseSnapshot(importText);
+      mergeReport = await mergeSnapshot(snapshot);
       await refreshCounts();
-      importOpen = false;
-      importText = '';
     } catch (error) {
-      importError = error instanceof Error ? error.message : '导入失败';
+      mergeReport = null;
+      importError = error instanceof Error ? error.message : '合档失败，已撤回全部改动';
     }
+  }
+
+  function closeImport(): void {
+    importOpen = false;
+    importText = '';
+    importError = null;
+    mergeReport = null;
+  }
+
+  /** 合档报告的分类行 */
+  function reportRows(report: MergeReport): Array<[string, MergeCounts]> {
+    return [
+      ['钢琴', report.pianos],
+      ['调律', report.tunings],
+      ['维修', report.voicings],
+      ['环境', report.environments],
+      ['提醒', report.reminders]
+    ];
+  }
+
+  /** 挂起记录的分组编号清单 */
+  function suspendedSummary(report: MergeReport): string {
+    const labels: Record<keyof MergeReport['suspendedIds'], string> = {
+      tunings: '调律',
+      voicings: '维修',
+      environments: '环境',
+      reminders: '提醒'
+    };
+    return (Object.entries(report.suspendedIds) as Array<[keyof MergeReport['suspendedIds'], string[]]>)
+      .filter(([, ids]) => ids.length > 0)
+      .map(([key, ids]) => `${labels[key]}：${ids.join('、')}`)
+      .join('；');
   }
 
   async function resetDemo(): Promise<void> {
@@ -245,7 +274,8 @@
         onclick={() => {
           importOpen = true;
           importError = null;
-        }}>导入备份</button
+          mergeReport = null;
+        }}>合并备份</button
       >
       <button type="button" class="btn-primary" onclick={openCreate} disabled={$pianos.length === 0}>+ 新建周期提醒</button>
     </div>
@@ -431,18 +461,67 @@
       type="button"
       class="absolute inset-0 cursor-default"
       aria-label="关闭弹窗"
-      onclick={() => (importOpen = false)}
+      onclick={closeImport}
     ></button>
     <div class="modal-panel relative" role="dialog" aria-modal="true">
-      <h3 class="mb-3 text-base font-semibold">导入本地库备份</h3>
+      <h3 class="mb-3 text-base font-semibold">合并备份到本地库</h3>
       {#if importError}
         <div class="mb-3 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-700">{importError}</div>
       {/if}
-      <textarea class="field h-48 font-mono text-xs" bind:value={importText} placeholder="粘贴导出的 JSON 备份内容"></textarea>
-      <div class="mt-4 flex justify-end gap-2">
-        <button type="button" class="btn" onclick={() => (importOpen = false)}>取消</button>
-        <button type="button" class="btn-primary" onclick={doImport}>确认导入（覆盖现有数据）</button>
-      </div>
+      {#if mergeReport}
+        <div class="mb-3 rounded-lg bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
+          合档完成：全部改动已写入本地库，调律偏差与复调标记、周期提醒剩余天数、环境超标天数已一并刷新。
+        </div>
+        <table class="w-full text-sm">
+          <thead class="border-b border-stone-200 text-left text-xs text-stone-500">
+            <tr>
+              <th class="py-1">档案</th>
+              <th class="py-1">新增</th>
+              <th class="py-1">覆盖</th>
+              <th class="py-1">挂起</th>
+              <th class="py-1">未变</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each reportRows(mergeReport) as [label, counts]}
+              <tr class="border-b border-stone-100">
+                <td class="py-1">{label}</td>
+                <td class="py-1 tabular-nums text-emerald-700">{counts.added}</td>
+                <td class="py-1 tabular-nums text-amber-700">{counts.overwritten}</td>
+                <td class="py-1 tabular-nums {counts.suspended > 0 ? 'font-semibold text-rose-700' : ''}">{counts.suspended}</td>
+                <td class="py-1 tabular-nums text-stone-500">{counts.unchanged}</td>
+              </tr>
+            {/each}
+            <tr class="font-semibold">
+              <td class="py-1">合计</td>
+              <td class="py-1 tabular-nums text-emerald-700">{mergeReport.total.added}</td>
+              <td class="py-1 tabular-nums text-amber-700">{mergeReport.total.overwritten}</td>
+              <td class="py-1 tabular-nums {mergeReport.total.suspended > 0 ? 'text-rose-700' : ''}">{mergeReport.total.suspended}</td>
+              <td class="py-1 tabular-nums text-stone-500">{mergeReport.total.unchanged}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="mt-2 text-xs text-stone-500">
+          派生字段重算：调律 {mergeReport.recalculated.tunings} 条 · 提醒 {mergeReport.recalculated.reminders} 条 · 环境 {mergeReport.recalculated.environments} 条
+        </p>
+        {#if mergeReport.total.suspended > 0}
+          <div class="mt-2 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-700">
+            以下子记录找不到对应钢琴档案，已挂起未写库：{suspendedSummary(mergeReport)}
+          </div>
+        {/if}
+        <div class="mt-4 flex justify-end">
+          <button type="button" class="btn-primary" onclick={closeImport}>完成</button>
+        </div>
+      {:else}
+        <p class="mb-3 text-xs text-stone-500">
+          按编号逐条对齐五类档案：同一条取时间戳较新的版本，主库缺少的照搬过来，找不到钢琴档案的子记录会挂起不写库；合档要么全部完成、要么撤回。旧备份缺少时间戳的行按较旧处理，不会覆盖主库新录的内容。
+        </p>
+        <textarea class="field h-48 font-mono text-xs" bind:value={importText} placeholder="粘贴导出的 JSON 备份内容"></textarea>
+        <div class="mt-4 flex justify-end gap-2">
+          <button type="button" class="btn" onclick={closeImport}>取消</button>
+          <button type="button" class="btn-primary" onclick={doMerge}>确认合档</button>
+        </div>
+      {/if}
     </div>
   </div>
 {/if}

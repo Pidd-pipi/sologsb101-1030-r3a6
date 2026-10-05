@@ -205,27 +205,23 @@ export async function removeReminder(id: string): Promise<void> {
   await db.reminders.delete(id);
 }
 
-/* --------------------------- 整库导入导出 --------------------------- */
+/* --------------------------- 整库导出 --------------------------- */
+
+/** 备份行：业务字段 + 可选的行修订号与时间戳（旧备份可能缺失，合并时按缺失兼容） */
+export type SnapshotRow<T> = T & Partial<Revisioned>;
 
 export interface DatabaseSnapshot {
   name: string;
   schemaVersion: number;
   exportedAt: string;
-  pianos: Piano[];
-  tunings: Tuning[];
-  voicings: Voicing[];
-  environments: Environment[];
-  reminders: Reminder[];
+  pianos: Array<SnapshotRow<Piano>>;
+  tunings: Array<SnapshotRow<Tuning>>;
+  voicings: Array<SnapshotRow<Voicing>>;
+  environments: Array<SnapshotRow<Environment>>;
+  reminders: Array<SnapshotRow<Reminder>>;
 }
 
-function stripRow<T extends Revisioned>(row: T): Omit<T, keyof Revisioned> {
-  const copy = { ...row } as Record<string, unknown>;
-  delete copy.revision;
-  delete copy.createdAt;
-  delete copy.updatedAt;
-  return copy as Omit<T, keyof Revisioned>;
-}
-
+/** 导出整库备份：保留行修订号与时间戳，离线设备带回后合档才能按时间戳比较新旧 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
   const [pianos, tunings, voicings, environments, reminders] = await Promise.all([
     db.pianos.toArray(),
@@ -238,34 +234,12 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     name: DB_NAME,
     schemaVersion: DB_SCHEMA_VERSION,
     exportedAt: nowIso(),
-    pianos: pianos.map(stripRow),
-    tunings: tunings.map(stripRow),
-    voicings: voicings.map(stripRow),
-    environments: environments.map(stripRow),
-    reminders: reminders.map(stripRow)
+    pianos,
+    tunings,
+    voicings,
+    environments,
+    reminders
   };
-}
-
-function stamp<T>(row: T): T & Revisioned {
-  const now = Date.now();
-  return { ...row, revision: ROW_REVISION, createdAt: now, updatedAt: now };
-}
-
-export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', [db.pianos, db.tunings, db.voicings, db.environments, db.reminders], async () => {
-    await Promise.all([
-      db.pianos.clear(),
-      db.tunings.clear(),
-      db.voicings.clear(),
-      db.environments.clear(),
-      db.reminders.clear()
-    ]);
-    await db.pianos.bulkPut(snapshot.pianos.map(stamp));
-    await db.tunings.bulkPut(snapshot.tunings.map(stamp));
-    await db.voicings.bulkPut(snapshot.voicings.map(stamp));
-    await db.environments.bulkPut(snapshot.environments.map(stamp));
-    await db.reminders.bulkPut(snapshot.reminders.map(stamp));
-  });
 }
 
 /** 清空全部数据并重新灌入演示数据 */
